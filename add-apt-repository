@@ -1,0 +1,122 @@
+#!/bin/bash
+
+set -e
+
+die() {
+  echo "❌ Error: $1" >&2
+  exit 1
+}
+
+list_repositories() {
+  echo "📦 Enabled APT repositories:"
+  echo
+  [ -f /etc/apt/sources.list ] && {
+    echo "▶ /etc/apt/sources.list:"
+    grep -Ev '^\s*#|^\s*$' /etc/apt/sources.list || echo "(none)"
+    echo
+  }
+  [ -d /etc/apt/sources.list.d ] && {
+    for f in /etc/apt/sources.list.d/*.list; do
+      [ -e "$f" ] || continue
+      echo "▶ $f:"
+      grep -Ev '^\s*#|^\s*$' "$f" || echo "(empty)"
+      echo
+    done
+  }
+  exit 0
+}
+
+if [[ "$1" == "--list" ]]; then
+  list_repositories
+fi
+
+[ "$EUID" -ne 0 ] && die "Please run with sudo."
+[ $# -lt 1 ] && die "Usage: sudo add-apt-repository <ppa:... | deb ... | deb-src ...> or --list"
+
+input="$1"
+
+for cmd in curl gpg; do
+  command -v "$cmd" &>/dev/null || die "$cmd is not installed."
+done
+
+# Determine codename
+if grep -q "^DEBIAN_CODENAME=" /etc/os-release; then
+  ubuntu_codename=$(curl -s http://changelogs.ubuntu.com/meta-release-lts | grep -oP '(?<=^LTS_CODENAME=)\w+')
+else
+  ubuntu_codename=$(grep -oP 'UBUNTU_CODENAME=\K\w+' /etc/os-release)
+  [ -z "$ubuntu_codename" ] && ubuntu_codename=$(curl -s http://changelogs.ubuntu.com/meta-release-lts | grep -oP '(?<=^LTS_CODENAME=)\w+')
+fi
+[ -z "$ubuntu_codename" ] && die "Unable to determine Ubuntu codename."
+
+get_ppa_key() {
+  local username=$1
+  local repository=$2
+  local ppa_url="https://api.launchpad.net/devel/~$username/+archive/ubuntu/$repository"
+
+  local json
+  if ! json=$(curl -s -H "Accept: application/json" "$ppa_url"); then
+    return 1
+  fi
+
+  local key
+  key=$(echo "$json" | grep -oP '(?<="signing_key_fingerprint": ")[^"]+')
+
+  if [[ -z "$key" ]]; then
+    # fallback to HTML parsing
+    local html
+    if ! html=$(curl -s "https://launchpad.net/~$username/+archive/ubuntu/$repository"); then
+      return 1
+    fi
+    key=$(echo "$html" | grep -oP 'pub&nbsp;.*?<a href="/[^"]+">(\w+)</a>' | grep -oP '[A-F0-9]{16}' | head -n1)
+  fi
+  echo "$key"
+}
+
+if [[ "$input" =~ ^ppa:([a-z0-9-]+)/([a-z0-9-]+)$ ]]; then
+  username="${BASH_REMATCH[1]}"
+  repository="${BASH_REMATCH[2]}"
+  echo "🌀 Adding PPA: $input"
+
+  key_fingerprint=$(get_ppa_key "$username" "$repository") || die "Failed to retrieve PPA key."
+  [ -z "$key_fingerprint" ] && die "Could not find GPG key fingerprint."
+
+  echo "🔑 Importing GPG key: $key_fingerprint"
+  gpg --keyserver keyserver.ubuntu.com --recv-keys "$key_fingerprint"
+  mkdir -p /etc/apt/keyrings
+  gpg --export --armor "$key_fingerprint" | gpg --dearmor | sudo tee /etc/apt/keyrings/"$repository".gpg >/dev/null
+
+  list_file="/etc/apt/sources.list.d/$repository.list"
+  echo "deb [signed-by=/etc/apt/keyrings/$repository.gpg arch=amd64] https://ppa.launchpadcontent.net/$username/$repository/ubuntu $ubuntu_codename main" | sudo tee "$list_file" >/dev/null
+
+elif [[ "$input" =~ ^deb(-src)?[[:space:]] ]]; then
+  echo "📄 Adding repository: $input"
+  repo_hash=$(echo "$input" | sha256sum | cut -d' ' -f1)
+  list_file="/etc/apt/sources.list.d/custom-${repo_hash:0:8}.list"
+
+  if [[ "$input" =~ signed-by=([^[:space:]\]]+) ]]; then
+    key_url="${BASH_REMATCH[1]}"
+    key_name=$(basename "$key_url" | sed 's/\.[a-z]*$//')
+    key_path="/etc/apt/keyrings/${key_name}.gpg"
+    echo "🔐 Downloading GPG key from $key_url"
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL "$key_url" | gpg --dearmor | sudo tee "$key_path" >/dev/null
+    input=$(echo "$input" | sed "s|signed-by=$key_url|signed-by=$key_path|")
+  fi
+
+  echo "$input" | sudo tee "$list_file" >/dev/null
+
+elif [[ "$input" =~ ^(file:|cdrom:) ]]; then
+  echo "📁 Adding local source: $input"
+  repo_hash=$(echo "$input" | sha256sum | cut -d' ' -f1)
+  list_file="/etc/apt/sources.list.d/local-${repo_hash:0:8}.list"
+  echo "$input" | sudo tee "$list_file" >/dev/null
+
+else
+  die "Unsupported repository format: $input"
+fi
+
+echo "🔄 Updating APT..."
+sudo apt update
+
+echo "✅ Repository added successfully!"
+
